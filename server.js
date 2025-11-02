@@ -6,15 +6,40 @@ const cors = require("cors");
 const { assignDriverForBooking } = require("./assigner");
 const { runRebalancer } = require("./rebalancer");
 
-// === CONFIG / INIT ===
-// Point this to your service account JSON path or set GOOGLE_APPLICATION_CREDENTIALS env var.
-const serviceAccount = require("./serviceAccountKey.json");
+// === FIREBASE INIT ===
+// Use environment variable on Render, fallback to local file for development
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
+let adminConfig;
+
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  // Render or any cloud platform: JSON string stored in env var
+  try {
+    adminConfig = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({
+      credential: admin.credential.cert(adminConfig),
+    });
+    console.log("✅ Firebase initialized from environment variable");
+  } catch (err) {
+    console.error("❌ Failed to parse FIREBASE_SERVICE_ACCOUNT env var:", err);
+    process.exit(1);
+  }
+} else {
+  // Local dev: use serviceAccountKey.json file
+  try {
+    const serviceAccount = require("./serviceAccountKey.json");
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    console.log("✅ Firebase initialized from local serviceAccountKey.json");
+  } catch (err) {
+    console.error("❌ Missing serviceAccountKey.json or invalid format:", err);
+    process.exit(1);
+  }
+}
 
 const db = admin.firestore();
+
+// === EXPRESS SETUP ===
 const app = express();
 app.use(bodyParser.json());
 app.use(cors());
@@ -22,8 +47,7 @@ app.use(cors());
 // Simple health check
 app.get("/", (req, res) => res.send("Dropee assignment server running"));
 
-// Webhook: create booking + assign immediately
-// (Use this if you want to POST new bookings here instead of writing directly to Firestore)
+// === WEBHOOK: Create booking + auto-assign ===
 app.post("/booking", async (req, res) => {
   try {
     const booking = req.body;
@@ -31,7 +55,6 @@ app.post("/booking", async (req, res) => {
       return res.status(400).json({ error: "invalid booking payload" });
     }
 
-    // add timestamp & default fields
     const newBooking = {
       ...booking,
       status: booking.status || "pending",
@@ -41,10 +64,10 @@ app.post("/booking", async (req, res) => {
     const ref = await db.collection("bookings").add(newBooking);
     const bookingId = ref.id;
 
-    // attempt to assign immediately (best-effort)
-    assignDriverForBooking(admin, bookingId).catch((err) => {
-      console.error("assigner error:", err.message);
-    });
+    // best-effort auto-assign
+    assignDriverForBooking(admin, bookingId).catch((err) =>
+      console.error("assigner error:", err.message)
+    );
 
     res.json({ bookingId });
   } catch (err) {
@@ -53,31 +76,33 @@ app.post("/booking", async (req, res) => {
   }
 });
 
-// Optionally run the continuous listener for new bookings with status == 'pending'
+// === FIRESTORE LISTENER ===
 function startBookingListener() {
   console.log("Starting Firestore bookings listener...");
   const bookingsQuery = db.collection("bookings").where("status", "==", "pending");
 
-  bookingsQuery.onSnapshot((snap) => {
-    snap.docChanges().forEach((change) => {
-      if (change.type === "added") {
-        const bookingId = change.doc.id;
-        console.log("New pending booking:", bookingId);
-        assignDriverForBooking(admin, bookingId).catch((err) => {
-          console.error("assigner error:", err.message);
-        });
-      }
-    });
-  }, (err) => {
-    console.error("Listener error:", err);
-  });
+  bookingsQuery.onSnapshot(
+    (snap) => {
+      snap.docChanges().forEach((change) => {
+        if (change.type === "added") {
+          const bookingId = change.doc.id;
+          console.log("New pending booking:", bookingId);
+          assignDriverForBooking(admin, bookingId).catch((err) =>
+            console.error("assigner error:", err.message)
+          );
+        }
+      });
+    },
+    (err) => {
+      console.error("Listener error:", err);
+    }
+  );
 }
 
-// Choose whether to start the listener:
 const ENABLE_LISTENER = true;
 if (ENABLE_LISTENER) startBookingListener();
 
-// Add endpoint to manually trigger rebalancer
+// === MANUAL REBALANCE ENDPOINT ===
 app.post("/rebalance", async (req, res) => {
   try {
     const autoApply = req.body.autoApply === true;
@@ -89,29 +114,28 @@ app.post("/rebalance", async (req, res) => {
   }
 });
 
-// Start periodic rebalancer
+// === PERIODIC REBALANCER ===
 function startPeriodicRebalancer() {
   console.log("Starting periodic rebalancer...");
-  
-  // Run rebalancer every 5 minutes
-  const REBALANCE_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
-  
-  // Run immediately on startup
-  runRebalancer(admin, true).catch(err => {
+
+  const REBALANCE_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+  // Run immediately
+  runRebalancer(admin, true).catch((err) => {
     console.error("Rebalancer error:", err);
   });
-  
+
   // Then run periodically
   setInterval(() => {
-    runRebalancer(admin, true).catch(err => {
+    runRebalancer(admin, true).catch((err) => {
       console.error("Rebalancer error:", err);
     });
   }, REBALANCE_INTERVAL);
 }
 
-// Enable periodic rebalancer
 const ENABLE_REBALANCER = true;
 if (ENABLE_REBALANCER) startPeriodicRebalancer();
 
+// === START SERVER ===
 const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, '0.0.0.0', () => console.log(`Server listening on ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server listening on ${PORT}`));
