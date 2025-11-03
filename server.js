@@ -51,8 +51,29 @@ app.get("/", (req, res) => res.send("Dropee assignment server running"));
 app.post("/booking", async (req, res) => {
   try {
     const booking = req.body;
-    if (!booking || !booking.pickup || !booking.number) {
-      return res.status(400).json({ error: "invalid booking payload" });
+    
+    // Handle new data format with latitude and longitude
+    if (booking.latitude && booking.longitude) {
+      booking.pickup = {
+        lat: parseFloat(booking.latitude),
+        lng: parseFloat(booking.longitude)
+      };
+      // Remove the original fields to keep data clean
+      delete booking.latitude;
+      delete booking.longitude;
+    }
+    
+    // Ensure pickup coordinates are properly formatted
+    if (!booking || !booking.number) {
+      return res.status(400).json({ error: "invalid booking payload: missing required fields" });
+    }
+    
+    if (!booking.pickup) {
+      booking.pickup = {
+        lat: 0,
+        lng: 0
+      };
+      console.log("Warning: Created default pickup coordinates for booking");
     }
 
     const newBooking = {
@@ -60,6 +81,12 @@ app.post("/booking", async (req, res) => {
       status: booking.status || "pending",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
+
+    // Ensure pickup coordinates are numbers
+    if (newBooking.pickup) {
+      newBooking.pickup.lat = parseFloat(newBooking.pickup.lat);
+      newBooking.pickup.lng = parseFloat(newBooking.pickup.lng);
+    }
 
     const ref = await db.collection("bookings").add(newBooking);
     const bookingId = ref.id;
@@ -83,10 +110,36 @@ function startBookingListener() {
 
   bookingsQuery.onSnapshot(
     (snap) => {
-      snap.docChanges().forEach((change) => {
+      snap.docChanges().forEach(async (change) => {
         if (change.type === "added") {
           const bookingId = change.doc.id;
-          console.log("New pending booking:", bookingId);
+          const bookingData = change.doc.data();
+          console.log("New pending booking:", bookingData.number || bookingId);
+          
+          // Handle new data format with latitude and longitude
+          if (bookingData.latitude && bookingData.longitude) {
+            // Update the document with proper pickup format
+            await db.collection("bookings").doc(bookingId).update({
+              pickup: {
+                lat: parseFloat(bookingData.latitude),
+                lng: parseFloat(bookingData.longitude)
+              },
+              latitude: admin.firestore.FieldValue.delete(),
+              longitude: admin.firestore.FieldValue.delete()
+            });
+            console.log("Updated booking with proper pickup format");
+          } else if (!bookingData.pickup) {
+            // Create default pickup if missing
+            await db.collection("bookings").doc(bookingId).update({
+              pickup: {
+                lat: 0,
+                lng: 0
+              }
+            });
+            console.log("Warning: Created default pickup coordinates for booking");
+          }
+          
+          // Now assign driver
           assignDriverForBooking(admin, bookingId).catch((err) =>
             console.error("assigner error:", err.message)
           );
